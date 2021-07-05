@@ -374,6 +374,12 @@ static void uncaught_exception_handler (NSException *exception) {
     abort();
 }
 
+struct plcr_exception_live_report_context {
+    plcrash_log_writer_t *writer;
+    plcrash_async_file_t *file;
+    plcrash_async_image_list_t *images;
+    plcrash_log_signal_info_t *info;
+};
 
 @interface PLCrashReporter (PrivateMethods)
 
@@ -806,6 +812,107 @@ cleanup:
     return [self generateLiveReportWithThread: pl_mach_thread_self() error: outError];
 }
 
+- (NSData *)generateLiveReportWithException:(NSException *)exception {
+    return [self generateLiveReportWithException:exception thread:pl_mach_thread_self() error:nil];
+}
+
+- (NSData *)generateLiveReportWithException:(NSException *)exception thread:(thread_t)thread error:(NSError *__autoreleasing*)outError {
+    plcrash_log_writer_t writer;
+    plcrash_async_file_t file;
+    plcrash_async_image_list_t image_list;
+    plcrash_error_t err;
+
+    /* Open the output file */
+    NSString *templateStr = [NSTemporaryDirectory() stringByAppendingPathComponent: @"live_crash_report.XXXXXX"];
+    char *path = strdup([templateStr fileSystemRepresentation]);
+
+    int fd = mkstemp(path);
+    if (fd < 0) {
+        plcrash_populate_posix_error(outError, errno, NSLocalizedString(@"Failed to create temporary path", @"Error opening temporary output path"));
+        free(path);
+
+        return nil;
+    }
+
+    /* Initialize the output context */
+    plcrash_log_writer_init(&writer, _applicationIdentifier, _applicationVersion, _applicationMarketingVersion, [self mapToAsyncSymbolicationStrategy: _config.symbolicationStrategy], true);
+    plcrash_async_file_init(&file, fd, MAX_REPORT_BYTES);
+
+    /* Mock up a SIGSEGV-based signal info */
+    plcrash_log_signal_info_t info;
+    plcrash_log_bsd_signal_info_t bsd_info;
+    plcrash_log_mach_signal_info_t mach_info;
+    mach_exception_data_type_t mach_codes[2];
+    {
+        bsd_info.code = SEGV_MAPERR;
+        bsd_info.signo = SIGSEGV;
+        bsd_info.address = __builtin_return_address(0);
+
+        mach_info.type = EXC_BAD_ACCESS;
+        mach_info.code = mach_codes;
+        mach_info.code_count = sizeof(mach_codes) / sizeof(mach_codes[0]);
+        mach_codes[0] = KERN_PROTECTION_FAILURE;
+        mach_codes[1] = (uintptr_t) bsd_info.address;
+
+        info.mach_info = &mach_info;
+        info.bsd_info = &bsd_info;
+    }
+
+    /* Set an exception with a valid return address call stack. */
+    plcrash_log_writer_set_exception(&writer, exception);
+
+    /* Provide binary image info */
+    plcrash_nasync_image_list_init(&image_list, mach_task_self());
+    uint32_t image_count = _dyld_image_count();
+    for (uint32_t i = 0; i < image_count; i++) {
+        plcrash_nasync_image_list_append(&image_list, (uintptr_t) _dyld_get_image_header(i), _dyld_get_image_name(i));
+    }
+
+    /* Write the crash log using the already-initialized writer */
+    if (thread == pl_mach_thread_self()) {
+        struct plcr_live_report_context ctx = {
+            .writer = &writer,
+            .file = &file,
+            .info = &info
+        };
+        err = plcrash_async_thread_state_current(plcr_live_report_callback, &ctx);
+    } else {
+        err = plcrash_log_writer_write(&writer, thread, &shared_image_list, &file, &info, NULL);
+    }
+    plcrash_log_writer_close(&writer);
+
+    /* Flush the data */
+    plcrash_async_file_flush(&file);
+    plcrash_async_file_close(&file);
+
+    /* Check for write failure */
+    NSData *data;
+    if (err != PLCRASH_ESUCCESS) {
+        NSLog(@"Write failed with error %s", plcrash_async_strerror(err));
+        plcrash_populate_error(outError, PLCrashReporterErrorUnknown, @"Failed to write the crash report to disk", nil);
+        data = nil;
+        goto cleanup;
+    }
+
+    data = [NSData dataWithContentsOfFile: [NSString stringWithUTF8String: path]];
+    if (data == nil) {
+        /* This should only happen if our data is deleted out from under us */
+        plcrash_populate_error(outError, PLCrashReporterErrorUnknown, NSLocalizedString(@"Unable to open live crash report for reading", nil), nil);
+        goto cleanup;
+    }
+
+cleanup:
+    /* Finished -- clean up. */
+    plcrash_log_writer_free(&writer);
+
+    if (unlink(path) != 0) {
+        /* This shouldn't fail, but if it does, there's no use in returning nil */
+        NSLog(@"Failure occured deleting live crash report: %s", strerror(errno));
+    }
+
+    free(path);
+    return data;
+}
 
 /**
  * Set the callbacks that will be executed by the receiver after a crash has occured and been recorded by PLCrashReporter.
